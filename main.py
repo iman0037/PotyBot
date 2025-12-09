@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 import asyncpg
 from typing import Optional
+import ssl
 
 load_dotenv()
 
@@ -25,11 +26,42 @@ app = FastAPI()
 DB_POOL: Optional[asyncpg.pool.Pool] = None
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+
+async def _init_connection(conn):
+    # هر مقادیری که می‌خواهی برای هر کانکشن تنظیم کنی:
+    try:
+        # جلوگیری از تراکنش‌های خیلی طولانی در DB-side
+        await conn.execute("SET statement_timeout = 5000;")  # ms
+        await conn.execute("SET idle_in_transaction_session_timeout = 5000;")
+    except Exception as e:
+        print("init_connection warn:", e)
+
 async def init_db():
     global DB_POOL
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL not set in env")
-    DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+    # SSL handling: اگر DATABASE_URL شامل sslmode=require یا provider لازم دارد
+    ssl_ctx = None
+    if "sslmode=require" in DATABASE_URL or os.getenv("DB_SSL", "1") == "1":
+        try:
+            ssl_ctx = ssl.create_default_context()
+        except Exception as e:
+            print("could not create ssl context:", e)
+            ssl_ctx = None
+
+    # create pool with reasonable sizes and init function
+    DB_POOL = await asyncpg.create_pool(
+        dsn=DATABASE_URL,
+        min_size=1,
+        max_size=8,  # برای یک اپ نه‌چندان سنگین این مقدار کافی است
+        init=_init_connection,
+        command_timeout=10,
+        max_inactive_connection_lifetime=300,  # نسخه‌های جدید asyncpg پشتیبانی میکنند
+        ssl=ssl_ctx
+    )
+
+    # create table if not exists (one-shot)
     async with DB_POOL.acquire() as conn:
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -222,37 +254,36 @@ async def load_data():
             }
     users = list(users_data.keys())
 
+
 async def change_wallet_atomic(user_id: int, delta: int) -> int:
     key = str(user_id)
     if DB_POOL is None:
-        users_data.setdefault(key, {"wallet": 50000, "state": None, "bet_amount": 0, "pending_msg_id": None, "last_global_sent": None, "temp_gift_to": None, "meta": {}})
+        users_data.setdefault(key, {"wallet": 50000, "state": None, "bet_amount": 0,
+                                    "pending_msg_id": None, "last_global_sent": None, "temp_gift_to": None, "meta": {}})
         users_data[key]["wallet"] = int(users_data[key].get("wallet", 50000)) + int(delta)
         return users_data[key]["wallet"]
-    async with DB_POOL.acquire() as conn:
-        try:
-            async with conn.transaction():
-                row = await conn.fetchrow("SELECT wallet FROM users WHERE user_id = $1 FOR UPDATE", int(user_id))
-                if row is None:
-                    init = 50000
-                    new_wallet = init + int(delta)
-                    await conn.execute(
-                        "INSERT INTO users (user_id, wallet, meta, updated_at) VALUES ($1, $2, $3, now())",
-                        int(user_id), new_wallet, {}
-                    )
-                else:
-                    new_wallet = int(row["wallet"]) + int(delta)
-                    await conn.execute(
-                        "UPDATE users SET wallet = $1, updated_at = now() WHERE user_id = $2",
-                        new_wallet, int(user_id)
-                    )
-        except Exception as e:
-            print("change_wallet_atomic db failed, fallback to memory:", e)
-            users_data.setdefault(key, {"wallet": 50000, "meta": {}})
-            users_data[key]["wallet"] = int(users_data[key].get("wallet", 50000)) + int(delta)
-            return users_data[key]["wallet"]
-        
+
+    try:
+        async with DB_POOL.acquire() as conn:
+            row = await conn.fetchrow("""
+                INSERT INTO users (user_id, wallet, meta, updated_at)
+                VALUES ($1, $2, $3, now())
+                ON CONFLICT (user_id) DO UPDATE
+                SET wallet = users.wallet + $2,
+                    updated_at = now()
+                RETURNING wallet;
+            """, int(user_id), int(delta), {})
+            new_wallet = int(row["wallet"])
+    except (asyncpg.PostgresError, ConnectionError, OSError) as e:
+        print("change_wallet_atomic db failed, fallback to memory:", str(e))
+        users_data.setdefault(key, {"wallet": 50000, "state": None, "bet_amount": 0,
+                                    "pending_msg_id": None, "last_global_sent": None, "temp_gift_to": None, "meta": {}})
+        users_data[key]["wallet"] = int(users_data[key].get("wallet", 50000)) + int(delta)
+        new_wallet = users_data[key]["wallet"]
+
     # sync to in-memory cache
-    users_data[key] = users_data.get(key, {"state": None, "bet_amount": 0, "pending_msg_id": None, "last_global_sent": None, "temp_gift_to": None, "meta": {}})
+    users_data[key] = users_data.get(key, {"state": None, "bet_amount": 0,
+                                           "pending_msg_id": None, "last_global_sent": None, "temp_gift_to": None, "meta": {}})
     users_data[key]["wallet"] = new_wallet
     if key not in users:
         users.append(key)
@@ -374,7 +405,7 @@ def easy_input(user_input):
     except Exception:
         raise ValueError("invalid amount")
 
-async def init_db_background(retries=5):
+async def init_db_background(retries=6):
     backoff = 1
     for attempt in range(1, retries + 1):
         try:
@@ -383,14 +414,14 @@ async def init_db_background(retries=5):
             print("DB initialized and users loaded:", len(users_data))
             return
         except Exception as e:
-            print(f"init_db_background attempt {attempt} failed: {e}")
+            print(f"init_db_background attempt {attempt} failed: {repr(e)}")
             if attempt < retries:
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                backoff = min(backoff*2, 30)
             else:
-                # آخرین تلاش هم شکست خورد — فقط لاگ کن و ادامه بده
                 print("init_db_background: all retries failed. continuing without DB.")
                 return
+
 
 # ---------- کیبوردها ----------
 def main_keyboard(chat_id):
