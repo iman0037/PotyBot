@@ -374,6 +374,24 @@ def easy_input(user_input):
     except Exception:
         raise ValueError("invalid amount")
 
+async def init_db_background(retries=5):
+    backoff = 1
+    for attempt in range(1, retries + 1):
+        try:
+            await init_db()
+            await load_data()
+            print("DB initialized and users loaded:", len(users_data))
+            return
+        except Exception as e:
+            print(f"init_db_background attempt {attempt} failed: {e}")
+            if attempt < retries:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+            else:
+                # آخرین تلاش هم شکست خورد — فقط لاگ کن و ادامه بده
+                print("init_db_background: all retries failed. continuing without DB.")
+                return
+
 # ---------- کیبوردها ----------
 def main_keyboard(chat_id):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -993,17 +1011,14 @@ async def main_message_handler(message: types.Message):
 
 @app.on_event("startup")
 async def on_startup():
-    try:
-        await init_db()
-        await load_data()
-        print("DB initialized and users loaded:", len(users_data))
-    except Exception as e:
-        print("DB init/load failed:", e)
+    # schedule DB init in background (do not block startup)
+    asyncio.create_task(init_db_background())
 
     # start prune loop background
     app.state.prune_task = asyncio.create_task(prune_loop())
     # start telethon in background
     asyncio.create_task(_start_telethon())
+
 
 
 @app.on_event("shutdown")
@@ -1046,4 +1061,8 @@ async def telegram_webhook(req: Request):
 
 @app.get("/")
 async def health():
+    return {"ok": True}
+
+@app.get("/kaithheathcheck")
+async def kaith_heathcheck():
     return {"ok": True}
