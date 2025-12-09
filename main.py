@@ -9,13 +9,18 @@ import asyncio
 import re
 import uuid
 from dotenv import load_dotenv
+
+from fastapi import FastAPI, Request, HTTPException
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = AsyncTeleBot(BOT_TOKEN, parse_mode=None)
 
 
-USERS_DATA_PATH = "data.json"
+app = FastAPI()
+
+USERS_DATA_PATH = os.getenv("DB_PATH")
 
 ADMINS = [8200758971]
 
@@ -41,7 +46,6 @@ async def prune_loop(interval_seconds: int = 3600, max_age_seconds: int = 86400)
                 try:
                     if now - entry.get("ts", 0) > max_age_seconds:
                         lock = origin_locks.get(oid)
-                        # اگر قفل وجود دارد و در حال استفاده است، حذف نکن
                         if lock and getattr(lock, "locked", None) and lock.locked():
                             continue
                         origin_index.pop(oid, None)
@@ -60,12 +64,10 @@ def ensure_origin_lock(origin_id: str) -> asyncio.Lock:
         origin_locks[origin_id] = lock
     return lock
 
-async def store_local_record(user_id: int, sent_message_id: int, header_plain: str, body_plain: str,
-                            source_chat_id: int, origin_id: str, is_bold_body: bool):
+async def store_local_record(user_id: int, sent_message_id: int, header_plain: str, body_plain: str, source_chat_id: int, origin_id: str, is_bold_body: bool):
     ukey = str(user_id)
     msgs = global_messages.setdefault(ukey, [])
     existing = next((m for m in msgs if m.get("message_id") == sent_message_id), None)
-    # نمایش نام را async بگیر
     display_name = await get_display_name(user_id) if user_id != source_chat_id else await get_display_name(source_chat_id)
     if existing:
         existing.update({
@@ -107,8 +109,10 @@ async def send_and_store(u_int: int, header_plain: str, body_plain: str, origin_
             sent = await bot.send_message(u_int, payload, parse_mode="HTML", reply_to_message_id=reply_to_local_mid)
         else:
             sent = await bot.send_message(u_int, payload, parse_mode="HTML")
-    except Exception:
+    except Exception as e:
+        print("send_and_store to", u_int, "failed:", e)
         return None
+
 
     lock = ensure_origin_lock(origin_id)
     async with lock:
@@ -116,15 +120,12 @@ async def send_and_store(u_int: int, header_plain: str, body_plain: str, origin_
     return sent.message_id
 
 def find_user_record_by_origin(user_key: int, source_chat_id: int, origin_id: str):
-    # ابتدا از origin_index سعی کن گرفتن local_mid
     entry = origin_index.get(origin_id)
     if entry:
         local_mid = entry["user_map"].get(str(user_key))
         if local_mid:
-            # سپس همان رکورد را در global_messages آن کاربر یافته و برگردان
             recs = global_messages.get(str(user_key), [])
             return next((m for m in recs if m.get("message_id") == local_mid), None)
-    # fallback: اسکن لیست کاربر (کمتر لازم خواهد شد)
     for m in global_messages.get(str(user_key), []):
         if m.get("source_chat_id") == source_chat_id and m.get("origin_id") == origin_id:
             return m
@@ -132,11 +133,9 @@ def find_user_record_by_origin(user_key: int, source_chat_id: int, origin_id: st
 
 async def increment_and_edit_reply_count_for_local(user_id_str: str, local_mid: int):
     key = (str(user_id_str), int(local_mid))
-    # تنها اگر رکورد محلی وجود داشته باشد مقدار را افزایش بده
     user_msgs = global_messages.get(str(user_id_str), [])
     user_ref_local = next((m for m in user_msgs if m.get("message_id") == int(local_mid)), None)
     if not user_ref_local:
-        # رکورد محلی نبود؛ نمی‌توان افزایش منطقی زد
         return
     reply_counts[key] = reply_counts.get(key, 0) + 1
     if reply_counts[key] > 1:
@@ -151,8 +150,9 @@ async def increment_and_edit_reply_count_for_local(user_id_str: str, local_mid: 
         new_text = f"{header_html}\n\n{body_html}\n\n⤶{pers}"
         try:
             await bot.edit_message_text(new_text, chat_id=int(user_id_str), message_id=int(local_mid), parse_mode="HTML")
-        except Exception:
-            pass
+        except Exception as e:
+            print("increment_and_edit_reply_count_for_local to", user_id_str, "failed:", e)
+
 
 def fmt_amount(num):
     try:
@@ -165,20 +165,13 @@ ZERO_WIDTH_RE = re.compile(r"[\u200B\u200C\u200D\uFEFF]")
 def normalize_text_for_check(s: str) -> str:
     if s is None:
         return ""
-    # حذف کاراکترهای صفر-عرض
     s = ZERO_WIDTH_RE.sub("", s)
-    # یکسان‌سازی انواع newlines
     s = re.sub(r"\r\n", "\n", s)
-    # فشرده‌سازی فضاهای متوالی به یک فاصله و trim
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 def build_plain_official_text(wallet: int) -> str:
-    """متنی که کاربرِ عادی (بدون بولد) می‌تواند (و نباید) دقیقاً همان را بفرستد."""
     return f"🙎🏻‍♂ You:\n\n💰موجودی من :\n{fmt_amount(wallet)} 🪙"
-
-
-
 
 
 # ---------- فایل خواندن/ذخیره ----------
@@ -208,17 +201,16 @@ async def save_data():
 
 load_data()
 
-api_id = "33725154"
-api_hash = "81e6a7c3717a64758c24b3ab95cf46ab"
-phone = "+989339633890"
-client = TelegramClient("bot", api_id, api_hash)
-async def get_chat_id(identifier: str, timeout=10):
+api_id = os.getenv("API_ID")
+api_hash = os.getenv("API_HASH")
+phone = os.getenv("PHONE")
+session = os.getenv("SESSION_NAME")
+client = TelegramClient(session, api_id, api_hash)
+async def get_chat_id(identifier: str):
     if identifier is None:
         return None
-    # پاکسازی
     if isinstance(identifier, str) and identifier.startswith("@"):
         identifier = identifier[1:]
-    # اگر عددی است
     try:
         if isinstance(identifier, str) and identifier.isdigit():
             return int(identifier)
@@ -229,7 +221,6 @@ async def get_chat_id(identifier: str, timeout=10):
         entity = await client.get_entity(identifier)
         return getattr(entity, "id", None)
     except Exception as e:
-        # لاگ برای دیباگ
         print("Telethon resolve error:", e)
         return None
 
@@ -242,12 +233,10 @@ def persian_digits(num):
 
 
 async def get_display_name(chat_id):
-    """سعی می‌کنیم نام کاربری/نام کاربر را بگیریم (اگر در دسترس باشد)."""
     try:
         ch = await bot.get_chat(chat_id)
         if getattr(ch, "username", None):
             return "@" + ch.username
-        # سعی می‌کنیم نام کامل را برگردانیم
         name = getattr(ch, "first_name", "") or ""
         if getattr(ch, "last_name", None):
             name += " " + ch.last_name
@@ -256,7 +245,6 @@ async def get_display_name(chat_id):
         return "ناشناس"
 
 async def ensure_user(chat_id):
-    """اگر کاربر وجود نداشت، مقدار پیش‌فرض بساز."""
     global users
     key = str(chat_id)
     if key not in users_data:
@@ -277,7 +265,6 @@ def user_exists(chat_id):
 
 def easy_input(user_input):
     s = user_input.strip()
-    # پشتیبانی از پسوندهای فارسی/انگلیسی همانند کد اصلی
     try:
         if s.endswith("میل"):
             return int(s[:-3]) * 1_000_000
@@ -293,7 +280,6 @@ def easy_input(user_input):
             return int(s[:-1]) * 1_000_000_000
         return int(s)
     except Exception:
-        # اگر تبدیل ناموفق بود، پرتاب نکن؛ کال‌کننده چک می‌کند
         raise ValueError("invalid amount")
 
 # ---------- کیبوردها ----------
@@ -407,18 +393,14 @@ async def main_message_handler(message: types.Message):
             return
 
         if text == "👥️️ تعداد اعضای چت جهانی":
-            # شمارش کسانی که در users_data هستند و پاسخگویی OK دارند.
             cnt = 0
             ms = await bot.send_message(uid, "درحال دریافت ...")
-            # تلاش برای ارسال یک پیام خالی برای تست
             for u in list(users_data.keys()):
                 try:
                     u_int = int(u)
                     if u_int != uid:
-                        # فرستادن پیام موقت و حذفش برای بررسی دسترسی
                         sent = await bot.send_message(u_int, ".")
                         if sent:
-                            # حذف
                             try:
                                 await bot.delete_message(u_int, sent.message_id)
                             except Exception:
@@ -512,14 +494,12 @@ async def main_message_handler(message: types.Message):
 
         if user.get("state") == "awaiting_admin_change_target" and int(uid) in ADMINS:
             rec_text = text.strip()
-            # پاکسازی کاراکترهای نامرئی و فاصله
             rec_text = rec_text.replace(" ", "").replace("\u200f", "").replace("\u200e", "")
             rec_id = None
 
             if rec_text == "خودم":
                 rec_id = uid
             else:
-                # اگر عددی است
                 if rec_text.isdigit():
                     rec_id = int(rec_text)
                 else:
@@ -532,7 +512,6 @@ async def main_message_handler(message: types.Message):
                 await bot.send_message(uid, "آیدی نامعتبر است. دوباره وارد کن یا «بازگشت ↪️» بزن.", reply_markup=back_keyboard())
                 return
 
-            # ذخیره هدف و رفتن به حالت دریافت مقدار
             user["admin_target"] = int(rec_id)
             user["state"] = "awaiting_admin_change_amount"
             await save_data()
@@ -556,17 +535,14 @@ async def main_message_handler(message: types.Message):
                 await save_data()
                 return
 
-            # بارگذاری/ساخت کاربر هدف در دیتابیس
             target = await ensure_user(rec_id)
             prev = int(target.get("wallet", 0))
             target["wallet"] = int(amount)
 
-            # پاکسازی state و ذخیره
             user["state"] = None
             user["admin_target"] = None
             await save_data()
 
-            # ارسال تایید فقط به ادمین (بدون اطلاع به کاربر هدف)
             await bot.send_message(uid, f"✅ تغییر سکه انجام شد.\n\nآیدی کاربر: {await get_display_name(rec_id)}\nموجودی قبلی: {fmt_amount(prev)} 🪙\nموجودی جدید: {fmt_amount(target['wallet'])} 🪙", reply_markup=main_keyboard(uid))
             return
 
@@ -935,41 +911,86 @@ async def main_message_handler(message: types.Message):
         await bot.send_message(uid, ("برای بازی با ربات از دکمه ها استفاده کن 🔣\n\nدر صورت نبودن دکمه ها /start رو بزن❗\n\n🌐 برای ارسال پیام در چت جهانی کافیه اول پیامتون نقطه بزارید. مثال:\n.سلام به همگی"), reply_markup=main_keyboard(uid))
 
 
-# ---------- اجرای بات ----------
-async def main():
-    print("Starting Telethon client...")
-    await client.start()
-
-    # start prune background task
-    prune_task = asyncio.create_task(prune_loop(interval_seconds=3600, max_age_seconds=86400))
-
-    print("Telethon started. Starting bot polling...")
-    polling_task = asyncio.create_task(bot._process_polling(timeout=60))
-
+@app.on_event("startup")
+async def on_startup():
+    # start telethon
     try:
-        await polling_task
-    except asyncio.CancelledError:
+        await client.start()
+        print("Telethon started")
+    except Exception as e:
+        print("Telethon start failed:", e)
+    # start prune loop background
+    app.state.prune_task = asyncio.create_task(prune_loop())
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    # cancel prune
+    task = getattr(app.state, "prune_task", None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except Exception:
+            pass
+    # remove webhook (optional)
+    try:
+        await bot.remove_webhook()
+    except Exception:
         pass
-    finally:
-        # cleanup
-        try:
-            polling_task.cancel()
-        except Exception:
-            pass
-        try:
-            prune_task.cancel()
-        except Exception:
-            pass
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        try:
-            await bot.close()
-        except Exception:
-            pass
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+
+@app.post(f"/{BOT_TOKEN}")
+async def telegram_webhook(req: Request):
+    try:
+        body = await req.body()
+        if not body:
+            raise HTTPException(400)
+        update = types.Update.de_json(body.decode("utf-8"))
+        # AsyncTeleBot supports process_new_updates as coroutine
+        await bot.process_new_updates([update])
+        return {"ok": True}
+    except Exception as e:
+        print("webhook error:", e)
+        raise HTTPException(500)
+    
+# ---------- اجرای بات ----------
+# async def main():
+#     print("Starting Telethon client...")
+#     await client.start()
+
+#     # start prune background task
+#     prune_task = asyncio.create_task(prune_loop(interval_seconds=3600, max_age_seconds=86400))
+
+#     print("Telethon started. Starting bot polling...")
+#     polling_task = asyncio.create_task(bot._process_polling(timeout=60))
+
+#     try:
+#         await polling_task
+#     except asyncio.CancelledError:
+#         pass
+#     finally:
+#         # cleanup
+#         try:
+#             polling_task.cancel()
+#         except Exception:
+#             pass
+#         try:
+#             prune_task.cancel()
+#         except Exception:
+#             pass
+#         try:
+#             await client.disconnect()
+#         except Exception:
+#             pass
+#         try:
+#             await bot.close()
+#         except Exception:
+#             pass
 
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# if __name__ == "__main__":
+#     asyncio.run(main())
