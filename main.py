@@ -5,14 +5,15 @@ import os
 import random
 import time
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 import asyncio
 import re
 import uuid
 from dotenv import load_dotenv
-
 from fastapi import FastAPI, Request, HTTPException
 
 load_dotenv()
+
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = AsyncTeleBot(BOT_TOKEN, parse_mode=None)
@@ -21,9 +22,20 @@ bot = AsyncTeleBot(BOT_TOKEN, parse_mode=None)
 app = FastAPI()
 
 USERS_DATA_PATH = os.getenv("DB_PATH")
+if not USERS_DATA_PATH:
+    USERS_DATA_PATH = "data.json"
+os.makedirs(os.path.dirname(USERS_DATA_PATH) or ".", exist_ok=True)
+if not os.path.exists(USERS_DATA_PATH):
+    with open(USERS_DATA_PATH, "w", encoding="utf-8") as f:
+        json.dump({}, f, ensure_ascii=False)
 
-ADMINS = list(map(int, os.getenv("ADMINS").strip("[]").split(",")))
 
+raw = os.getenv("ADMINS", "")
+ADMINS = []
+if raw:
+    ADMINS = [int(x.strip()) for x in raw.strip("[] ").split(",") if x.strip()]
+
+# ---------- داده‌های در حافظه ----------
 users_data = {}
 users = []
 global_messages = {}
@@ -201,28 +213,50 @@ async def save_data():
 
 load_data()
 
+
 api_id = os.getenv("API_ID")
 api_hash = os.getenv("API_HASH")
 phone = os.getenv("PHONE")
-session = os.getenv("SESSION_NAME")
-client = TelegramClient(session, api_id, api_hash)
-async def get_chat_id(identifier: str):
-    if identifier is None:
-        return None
-    if isinstance(identifier, str) and identifier.startswith("@"):
-        identifier = identifier[1:]
-    try:
-        if isinstance(identifier, str) and identifier.isdigit():
-            return int(identifier)
-    except Exception:
-        pass
 
+client = None
+
+async def _start_telethon():
+    global client
     try:
-        entity = await client.get_entity(identifier)
+        string_session = os.getenv("STRING_SESSION")
+        if string_session:
+            client = TelegramClient(StringSession(string_session), api_id, api_hash)
+            await client.start()
+        else:
+            client = None
+        print("Telethon started")
+    except Exception as e:
+        print("Telethon start failed:", e)
+
+
+async def get_chat_id(identifier: str):
+    if not identifier:
+        return None
+    s = identifier.strip()
+    if s.startswith("@"):
+        s = s[1:]
+    if s.isdigit():
+        return int(s)
+    if client is None:
+        return None
+    try:
+        entity = await client.get_entity(s)
         return getattr(entity, "id", None)
     except Exception as e:
         print("Telethon resolve error:", e)
+    try:
+        ch = await bot.get_chat(s)
+        if getattr(ch, "id", None):
+            return int(ch.id)
+    except Exception as e:
+        print("Bot resolve error:", e)
         return None
+
 
 
 # ---------- کمکی‌ها ----------
@@ -913,19 +947,12 @@ async def main_message_handler(message: types.Message):
 
 @app.on_event("startup")
 async def on_startup():
-    # start telethon
-    try:
-        await client.start()
-        print("Telethon started")
-    except Exception as e:
-        print("Telethon start failed:", e)
-    
     # start prune loop background
     app.state.prune_task = asyncio.create_task(prune_loop())
+    asyncio.create_task(_start_telethon())
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    # cancel prune
     task = getattr(app.state, "prune_task", None)
     if task:
         task.cancel()
@@ -949,8 +976,13 @@ async def telegram_webhook(req: Request):
         if not body:
             raise HTTPException(400)
         update = types.Update.de_json(body.decode("utf-8"))
+        # AsyncTeleBot supports process_new_updates as coroutine
         await bot.process_new_updates([update])
         return {"ok": True}
     except Exception as e:
         print("webhook error:", e)
         raise HTTPException(500)
+
+@app.get("/")
+async def health():
+    return {"ok": True}
