@@ -1,3 +1,5 @@
-pyTelegramBotAPI
-gunicorn
 fastapi
+uvicorn
+pyTelegramBotAPI
+telethon
+aiohttp

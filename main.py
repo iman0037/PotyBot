@@ -22,7 +22,7 @@ app = FastAPI()
 
 USERS_DATA_PATH = os.getenv("DB_PATH")
 
-ADMINS = [8200758971]
+ADMINS = list(map(int, os.getenv("ADMINS").strip("[]").split(",")))
 
 users_data = {}
 users = []
@@ -919,6 +919,7 @@ async def on_startup():
         print("Telethon started")
     except Exception as e:
         print("Telethon start failed:", e)
+    
     # start prune loop background
     app.state.prune_task = asyncio.create_task(prune_loop())
 
@@ -932,7 +933,6 @@ async def on_shutdown():
             await task
         except Exception:
             pass
-    # remove webhook (optional)
     try:
         await bot.remove_webhook()
     except Exception:
@@ -949,48 +949,8 @@ async def telegram_webhook(req: Request):
         if not body:
             raise HTTPException(400)
         update = types.Update.de_json(body.decode("utf-8"))
-        # AsyncTeleBot supports process_new_updates as coroutine
         await bot.process_new_updates([update])
         return {"ok": True}
     except Exception as e:
         print("webhook error:", e)
         raise HTTPException(500)
-    
-# ---------- اجرای بات ----------
-# async def main():
-#     print("Starting Telethon client...")
-#     await client.start()
-
-#     # start prune background task
-#     prune_task = asyncio.create_task(prune_loop(interval_seconds=3600, max_age_seconds=86400))
-
-#     print("Telethon started. Starting bot polling...")
-#     polling_task = asyncio.create_task(bot._process_polling(timeout=60))
-
-#     try:
-#         await polling_task
-#     except asyncio.CancelledError:
-#         pass
-#     finally:
-#         # cleanup
-#         try:
-#             polling_task.cancel()
-#         except Exception:
-#             pass
-#         try:
-#             prune_task.cancel()
-#         except Exception:
-#             pass
-#         try:
-#             await client.disconnect()
-#         except Exception:
-#             pass
-#         try:
-#             await bot.close()
-#         except Exception:
-#             pass
-
-
-
-# if __name__ == "__main__":
-#     asyncio.run(main())
