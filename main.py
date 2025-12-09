@@ -1,6 +1,5 @@
 from telebot.async_telebot import AsyncTeleBot, types
 from telebot.formatting import hbold, hspoiler, escape_html
-import json
 import os
 import random
 import time
@@ -11,6 +10,8 @@ import re
 import uuid
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
+import asyncpg
+from typing import Optional
 
 load_dotenv()
 
@@ -21,13 +22,25 @@ bot = AsyncTeleBot(BOT_TOKEN, parse_mode=None)
 
 app = FastAPI()
 
-USERS_DATA_PATH = os.getenv("DB_PATH")
-if not USERS_DATA_PATH:
-    USERS_DATA_PATH = "data.json"
-os.makedirs(os.path.dirname(USERS_DATA_PATH) or ".", exist_ok=True)
-if not os.path.exists(USERS_DATA_PATH):
-    with open(USERS_DATA_PATH, "w", encoding="utf-8") as f:
-        json.dump({}, f, ensure_ascii=False)
+DB_POOL: Optional[asyncpg.pool.Pool] = None
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+async def init_db():
+    global DB_POOL
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not set in env")
+    DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            wallet BIGINT NOT NULL DEFAULT 50000,
+            meta JSONB DEFAULT '{}'::jsonb,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+        );
+        """)
+
 
 
 raw = os.getenv("ADMINS", "")
@@ -186,32 +199,65 @@ def build_plain_official_text(wallet: int) -> str:
     return f"🙎🏻‍♂ You:\n\n💰موجودی من :\n{fmt_amount(wallet)} 🪙"
 
 
-# ---------- فایل خواندن/ذخیره ----------
-def load_data():
+# ---------- خواندن/ذخیره از/به PostgreSQL ----------
+async def load_data():
     global users_data, users
-    if os.path.exists(USERS_DATA_PATH):
-        try:
-            with open(USERS_DATA_PATH, "r", encoding="utf-8") as f:
-                users_data = json.load(f)
-        except Exception:
-            users_data = {}
-    else:
-        users_data = {}
+    users_data = {}
+    if DB_POOL is None:
+        users = []
+        return
+
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id, wallet, meta FROM users")
+        for r in rows:
+            uid = str(r["user_id"])
+            users_data[uid] = {
+                "wallet": int(r["wallet"]),
+                "meta": r["meta"] or {},
+                "state": None,
+                "bet_amount": 0,
+                "pending_msg_id": None,
+                "last_global_sent": None,
+                "temp_gift_to": None
+            }
     users = list(users_data.keys())
 
-SAVE_LOCK = asyncio.Lock()
+async def change_wallet_atomic(user_id: int, delta: int) -> int:
+    key = str(user_id)
+    if DB_POOL is None:
+        users_data.setdefault(key, {"wallet": 50000, "state": None, "bet_amount": 0, "pending_msg_id": None, "last_global_sent": None, "temp_gift_to": None, "meta": {}})
+        users_data[key]["wallet"] = int(users_data[key].get("wallet", 50000)) + int(delta)
+        return users_data[key]["wallet"]
+    async with DB_POOL.acquire() as conn:
+        try:
+            async with conn.transaction():
+                row = await conn.fetchrow("SELECT wallet FROM users WHERE user_id = $1 FOR UPDATE", int(user_id))
+                if row is None:
+                    init = 50000
+                    new_wallet = init + int(delta)
+                    await conn.execute(
+                        "INSERT INTO users (user_id, wallet, meta, updated_at) VALUES ($1, $2, $3, now())",
+                        int(user_id), new_wallet, {}
+                    )
+                else:
+                    new_wallet = int(row["wallet"]) + int(delta)
+                    await conn.execute(
+                        "UPDATE users SET wallet = $1, updated_at = now() WHERE user_id = $2",
+                        new_wallet, int(user_id)
+                    )
+        except Exception as e:
+            print("change_wallet_atomic db failed, fallback to memory:", e)
+            users_data.setdefault(key, {"wallet": 50000, "meta": {}})
+            users_data[key]["wallet"] = int(users_data[key].get("wallet", 50000)) + int(delta)
+            return users_data[key]["wallet"]
+        
+    # sync to in-memory cache
+    users_data[key] = users_data.get(key, {"state": None, "bet_amount": 0, "pending_msg_id": None, "last_global_sent": None, "temp_gift_to": None, "meta": {}})
+    users_data[key]["wallet"] = new_wallet
+    if key not in users:
+        users.append(key)
+    return new_wallet
 
-async def save_data():
-    data = json.dumps(users_data, ensure_ascii=False, indent=4)
-    loop = asyncio.get_running_loop()
-    def _write():
-        with open(USERS_DATA_PATH, "w", encoding="utf-8") as f:
-            f.write(data)
-    async with SAVE_LOCK:
-        await loop.run_in_executor(None, _write)
-
-
-load_data()
 
 
 api_id = os.getenv("API_ID")
@@ -288,11 +334,23 @@ async def ensure_user(chat_id):
             "bet_amount": 0,
             "pending_msg_id": None,
             "last_global_sent": None,
-            "temp_gift_to": None
+            "temp_gift_to": None,
+            "meta": {}
         }
-        await save_data()
         users = list(users_data.keys())
+        if DB_POOL:
+            async with DB_POOL.acquire() as conn:
+                try:
+                    await conn.execute("""
+                        INSERT INTO users (user_id, wallet, meta, updated_at)
+                        VALUES ($1, $2, $3, now())
+                        ON CONFLICT (user_id) DO NOTHING;
+                    """, int(chat_id), int(users_data[key]["wallet"]), users_data[key]["meta"])
+                except Exception as e:
+                    print("ensure_user: db insert failed", e)
     return users_data[key]
+
+
 
 def user_exists(chat_id):
     return str(chat_id) in users_data
@@ -368,7 +426,6 @@ async def start_handler(message: types.Message):
     user["state"] = None
     user["bet_amount"] = 0
     user["temp_gift_to"] = None
-    await save_data()
     txt = f"سلام! به ربات PotyBot {hspoiler('(نسخه آزمایشی)')} خوش اومدی 🌹\n\n🌐 برای ارسال پیام در چت جهانی کافیه اول پیامتون نقطه بزارید. مثال:\n.سلام به همگی"
     await bot.send_message(uid, txt, parse_mode="HTML", reply_markup=main_keyboard(uid))
 
@@ -376,7 +433,7 @@ async def start_handler(message: types.Message):
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 async def main_message_handler(message: types.Message):
         if time.time() - message.date > 30:
-            pass
+            return
 
         uid = message.chat.id
         text = message.text.strip()
@@ -387,7 +444,6 @@ async def main_message_handler(message: types.Message):
             user["state"] = None
             user["bet_amount"] = 0
             user["temp_gift_to"] = None
-            await save_data()
             await bot.send_message(uid, "بازگشت به منوی اصلی", reply_markup=main_keyboard(uid))
             return
 
@@ -403,14 +459,12 @@ async def main_message_handler(message: types.Message):
         if text == "👩‍🚀 پنل مدیریت" and int(uid) in ADMINS:
             user["state"] = None
             user["admin_target"] = None
-            await save_data()
             await bot.send_message(uid, "به پنل مدیریت خوش اومدی\n\nیک گزینه را انتخاب کن:", reply_markup=manage_keyboard())
             return
 
         if text == "💰 نمایش موجودی" and int(uid) in ADMINS:
             user["state"] = "awaiting_admin_show_target"
             user["admin_target"] = None
-            await save_data()
             kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
             kb.row(types.KeyboardButton("بازگشت ↪️"))
             await bot.send_message(uid, "آیدی کاربر موردنظر را وارد کن:", reply_markup=kb)
@@ -420,10 +474,21 @@ async def main_message_handler(message: types.Message):
         if text == "🪙 تغییر سکه" and int(uid) in ADMINS:
             user["state"] = "awaiting_admin_change_target"
             user["admin_target"] = None
-            await save_data()
             kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
             kb.row(types.KeyboardButton("خودم"), types.KeyboardButton("بازگشت ↪️"))
             await bot.send_message(uid, "آیدی کاربر موردنظر را وارد یا «خودم» را انتخاب کن:", reply_markup=kb)
+            return
+
+        if text == "🎲 تاس":
+            user["state"] = "awaiting_bet_amount"
+            sent = await bot.send_message(uid, f"🪙 مقدار شرط رو وارد کن:\n💰موجودی شما: {fmt_amount(user['wallet'])}", reply_markup=bet_amount_keyboard())
+            user["pending_msg_id"] = sent.message_id
+            return
+
+        if text == "🌱 گل یا پوچ":
+            user["state"] = "awaiting_rps_amount"
+            sent = await bot.send_message(uid, f"🪙 مقدار شرط رو وارد کن:\n💰موجودی شما: {fmt_amount(user['wallet'])}", reply_markup=bet_amount_keyboard())
+            user["pending_msg_id"] = sent.message_id
             return
 
         if text == "👥️️ تعداد اعضای چت جهانی":
@@ -444,22 +509,7 @@ async def main_message_handler(message: types.Message):
                     continue
             await bot.edit_message_text(f"👥️️ تعداد عضوهای چت جهانی: {cnt+1:,}", uid, ms.message_id)
             return
-        if text == "🎲 تاس":
-            user["state"] = "awaiting_bet_amount"
-            await save_data()
-            sent = await bot.send_message(uid, f"🪙 مقدار شرط رو وارد کن:\n💰موجودی شما: {fmt_amount(user['wallet'])}", reply_markup=bet_amount_keyboard())
-            user["pending_msg_id"] = sent.message_id
-            await save_data()
-            return
-
-        if text == "🌱 گل یا پوچ":
-            user["state"] = "awaiting_rps_amount"
-            await save_data()
-            sent = await bot.send_message(uid, f"🪙 مقدار شرط رو وارد کن:\n💰موجودی شما: {fmt_amount(user['wallet'])}", reply_markup=bet_amount_keyboard())
-            user["pending_msg_id"] = sent.message_id
-            await save_data()
-            return
-
+        
         # ---------- برترین‌ها ----------
         if text == "🏆 برترین‌ها":
             arr = []
@@ -488,7 +538,6 @@ async def main_message_handler(message: types.Message):
         if text == "🎁 گیفت":
             user["state"] = "awaiting_gift_recipient"
             user["temp_gift_to"] = None
-            await save_data()
             await bot.send_message(uid, "آیدی فرد گیرنده سکه را وارد کنید:", reply_markup=back_keyboard())
             return
 
@@ -512,7 +561,6 @@ async def main_message_handler(message: types.Message):
             if not user_exists(rec_id):
                 await bot.send_message(uid, "کاربر در دیتابیس موجود نیست — کاربر باید ابتدا /start را بزند تا حسابش ساخته شود.", reply_markup=manage_keyboard())
                 user["state"] = None
-                await save_data()
                 return
 
             target = await ensure_user(rec_id)
@@ -522,7 +570,6 @@ async def main_message_handler(message: types.Message):
             await bot.send_message(uid, f"💰 موجودی کاربر {name}:\n{fmt_amount(wallet)} 🪙", reply_markup=manage_keyboard())
             user["state"] = None
             user["admin_target"] = None
-            await save_data()
             return
 
 
@@ -548,7 +595,6 @@ async def main_message_handler(message: types.Message):
 
             user["admin_target"] = int(rec_id)
             user["state"] = "awaiting_admin_change_amount"
-            await save_data()
             moj = await ensure_user(rec_id)
             await bot.send_message(uid, f"💰موجودی فعلی کاربر {await get_display_name(rec_id)}:\n{fmt_amount(moj['wallet'])} 🪙\n\nمقدار جدید سکه کاربر را وارد کنید:", reply_markup=back_keyboard())
             return
@@ -566,18 +612,19 @@ async def main_message_handler(message: types.Message):
                 await bot.send_message(uid, "کاربر مشخص نشده، دوباره از گزینهٔ تغییر سکه استفاده کن.", reply_markup=main_keyboard(uid))
                 user["state"] = None
                 user["admin_target"] = None
-                await save_data()
                 return
 
             target = await ensure_user(rec_id)
             prev = int(target.get("wallet", 0))
-            target["wallet"] = int(amount)
+            # مقدار جدید amount را خوانده‌ای؛ محاسبه delta:
+            delta = int(amount) - prev
+            new_wallet = await change_wallet_atomic(rec_id, delta)
 
             user["state"] = None
             user["admin_target"] = None
-            await save_data()
 
-            await bot.send_message(uid, f"✅ تغییر سکه انجام شد.\n\nآیدی کاربر: {await get_display_name(rec_id)}\nموجودی قبلی: {fmt_amount(prev)} 🪙\nموجودی جدید: {fmt_amount(target['wallet'])} 🪙", reply_markup=main_keyboard(uid))
+            await bot.send_message(uid, f"✅ تغییر سکه انجام شد.\n\nآیدی کاربر: {await get_display_name(rec_id)}\nموجودی قبلی: {fmt_amount(prev)} 🪙\nموجودی جدید: {fmt_amount(new_wallet)} 🪙", reply_markup=main_keyboard(uid))
+
             return
 
         # ---------- اگر در حالت انتظار مقدار شرط باشیم ----------
@@ -603,7 +650,6 @@ async def main_message_handler(message: types.Message):
 
             user["bet_amount"] = amount
             user["state"] = "awaiting_even_odd"
-            await save_data()
 
             # ویرایش پیام قبلی (اگر داریم) یا ارسال پیام جدید
             try:
@@ -613,11 +659,9 @@ async def main_message_handler(message: types.Message):
                 else:
                     sent = await bot.send_message(uid, f"🪙 مقدار شرط: {fmt_amount(amount)} \n نوع شرط رو انتخاب کن 👇", reply_markup=dice_choice_keyboard())
                     user["pending_msg_id"] = sent.message_id
-                    await save_data()
             except Exception:
                 sent = await bot.send_message(uid, f"🪙 مقدار شرط: {fmt_amount(amount)} \n نوع شرط رو انتخاب کن 👇", reply_markup=dice_choice_keyboard())
                 user["pending_msg_id"] = sent.message_id
-                await save_data()
             return
 
         # ---------- انتخاب زوج/فرد یا عدد (حالت تاس) ----------
@@ -628,35 +672,42 @@ async def main_message_handler(message: types.Message):
                 dice = random.randint(1, 6)
                 Dice_mode = 'فرد' if dice in [1, 3, 5] else 'زوج'
                 if choice == Dice_mode:
-                    user["wallet"] += bet
+                    new_wallet = await change_wallet_atomic(uid, +bet)
                     try:
-                        await bot.edit_message_text(f'شما برنده شدید🙂✅\n\n➕{fmt_amount(bet)} سکه به شما اضافه شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی قبلی شما : {fmt_amount(user["wallet"] - bet)}\n=============================\n🪙موجودی فعلی شما : {fmt_amount(user["wallet"])}', uid, user.get("pending_msg_id") or 0)
+                        await bot.edit_message_text(f'شما برنده شدید🙂✅\n\n➕{fmt_amount(bet)} سکه به شما اضافه شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی قبلی شما : {fmt_amount(new_wallet - bet)}\n=============================\n🪙موجودی فعلی شما : {fmt_amount(new_wallet)}', uid, user.get("pending_msg_id") or 0)
                     except Exception:
-                        await bot.send_message(uid, f'شما برنده شدید🙂✅\n\n➕{fmt_amount(bet)} سکه به شما اضافه شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی فعلی شما : {fmt_amount(user["wallet"])}')
+                        await bot.send_message(uid, f'شما برنده شدید🙂✅\n\n➕{fmt_amount(bet)} سکه به شما اضافه شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی فعلی شما : {fmt_amount(new_wallet)}')
                 else:
-                    user["wallet"] -= bet
-                    if user["wallet"] < 1000:
-                        user["wallet"] = 1000
+                    new_wallet = await change_wallet_atomic(uid, -bet)
+                    if new_wallet < 1000:
+                        diff = 1000 - new_wallet
+                        if diff > 0:
+                            new_wallet = await change_wallet_atomic(uid, diff)
+
                     try:
-                        await bot.edit_message_text(f'شما بازنده شدید🥺❌\n\n➖{fmt_amount(bet)} سکه از شما کم شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی قبلی شما : {fmt_amount(user["wallet"] + bet)}\n=============================\n🪙موجودی فعلی شما : {fmt_amount(user["wallet"])}', uid, user.get("pending_msg_id") or 0)
+                        await bot.edit_message_text(f'شما بازنده شدید🥺❌\n\n➖{fmt_amount(bet)} سکه از شما کم شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی قبلی شما : {fmt_amount(new_wallet + bet)}\n=============================\n🪙موجودی فعلی شما : {fmt_amount(new_wallet)}', uid, user.get("pending_msg_id") or 0)
                     except Exception:
-                        await bot.send_message(uid, f'شما بازنده شدید🥺❌\n\n➖{fmt_amount(bet)} سکه از شما کم شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی فعلی شما : {fmt_amount(user["wallet"])}')
+                        await bot.send_message(uid, f'شما بازنده شدید🥺❌\n\n➖{fmt_amount(bet)} سکه از شما کم شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی فعلی شما : {fmt_amount(new_wallet)}')
+            
             elif choice.isnumeric() and int(choice) in [1, 2, 3, 4, 5, 6]:
                 dice = random.randint(1, 6)
                 if int(choice) == dice:
-                    user["wallet"] += bet * 6
+                    new_wallet = await change_wallet_atomic(uid, +(bet*6))
                     try:
-                        await bot.edit_message_text(f'شما برنده شدید🙂✅\n\n➕{fmt_amount(bet*6)} سکه به شما اضافه شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی قبلی شما : {fmt_amount(user["wallet"] - bet * 6)}\n============================\n🪙موجودی فعلی شما : {fmt_amount(user["wallet"])}', uid, user.get("pending_msg_id") or 0)
+                        await bot.edit_message_text(f'شما برنده شدید🙂✅\n\n➕{fmt_amount(bet*6)} سکه به شما اضافه شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی قبلی شما : {fmt_amount(new_wallet - bet * 6)}\n============================\n🪙موجودی فعلی شما : {fmt_amount(new_wallet)}', uid, user.get("pending_msg_id") or 0)
                     except Exception:
-                        await bot.send_message(uid, f'شما برنده شدید🙂✅\n\n➕{fmt_amount(bet*6)} سکه به شما اضافه شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی فعلی شما : {fmt_amount(user["wallet"])}')
+                        await bot.send_message(uid, f'شما برنده شدید🙂✅\n\n➕{fmt_amount(bet*6)} سکه به شما اضافه شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی فعلی شما : {fmt_amount(new_wallet)}')
                 else:
-                    user["wallet"] -= bet
-                    if user["wallet"] < 1000:
-                        user["wallet"] = 1000
+                    new_wallet = await change_wallet_atomic(uid, -bet)
+                    if new_wallet < 1000:
+                        diff = 1000 - new_wallet
+                        if diff > 0:
+                            new_wallet = await change_wallet_atomic(uid, diff)
+
                     try:
-                        await bot.edit_message_text(f'شما بازنده شدید🥺❌\n\n➖{fmt_amount(bet)} سکه از شما کم شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی قبلی شما : {fmt_amount(user["wallet"] + bet)}\n=============================\n🪙موجودی فعلی شما : {fmt_amount(user["wallet"])}', uid, user.get("pending_msg_id") or 0)
+                        await bot.edit_message_text(f'شما بازنده شدید🥺❌\n\n➖{fmt_amount(bet)} سکه از شما کم شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی قبلی شما : {fmt_amount(new_wallet + bet)}\n=============================\n🪙موجودی فعلی شما : {fmt_amount(new_wallet)}', uid, user.get("pending_msg_id") or 0)
                     except Exception:
-                        await bot.send_message(uid, f'شما بازنده شدید🥺❌\n\n➖{fmt_amount(bet)} سکه از شما کم شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی فعلی شما : {fmt_amount(user["wallet"])}')
+                        await bot.send_message(uid, f'شما بازنده شدید🥺❌\n\n➖{fmt_amount(bet)} سکه از شما کم شد\n\n🎲 تاس رو شده: {dice}\n\n🪙موجودی فعلی شما : {fmt_amount(new_wallet)}')
             else:
                 await bot.send_message(uid, "انتخاب نامعتبر است.", reply_markup=dice_choice_keyboard())
                 return
@@ -665,7 +716,6 @@ async def main_message_handler(message: types.Message):
             user["state"] = None
             user["bet_amount"] = 0
             user["pending_msg_id"] = None
-            await save_data()
             await bot.send_message(uid, "برگشت به منوی اصلی", reply_markup=main_keyboard(uid))
             return
 
@@ -691,7 +741,6 @@ async def main_message_handler(message: types.Message):
 
             user["bet_amount"] = amount
             user["state"] = "awaiting_rps_choice"
-            await save_data()
             try:
                 if user.get("pending_msg_id"):
                     await bot.edit_message_text(f"🪙 مقدار شرط: {fmt_amount(amount)} \n حدس بزن گل تو کدوم دست رباته 👇", uid, user["pending_msg_id"])
@@ -699,35 +748,35 @@ async def main_message_handler(message: types.Message):
                 else:
                     sent = await bot.send_message(uid, f"🪙 مقدار شرط: {fmt_amount(amount)} \n حدس بزن گل تو کدوم دست رباته 👇", reply_markup=rps_choice_keyboard())
                     user["pending_msg_id"] = sent.message_id
-                    await save_data()
             except Exception:
                 sent = await bot.send_message(uid, f"🪙 مقدار شرط: {fmt_amount(amount)} \n حدس بزن گل تو کدوم دست رباته 👇", reply_markup=rps_choice_keyboard())
                 user["pending_msg_id"] = sent.message_id
-                await save_data()
             return
 
         if user.get("state") == "awaiting_rps_choice" and text in ["چپ 🤚", "راست ✋"]:
             bet = user["bet_amount"]
             bot_choice = random.choice(["چپ 🤚", "راست ✋"])
             if bot_choice == text:
-                user["wallet"] += bet
+                new_wallet =  await change_wallet_atomic(uid, +bet)
                 try:
-                    await bot.edit_message_text(f'شما گل را درست حدس زدید✅🙂\n\n➕{fmt_amount(bet)} سکه به شما اضافه شد\n\n🪙موجودی قبلی شما : {fmt_amount(user["wallet"] - bet)}\n=============================\n🪙موجودی فعلی شما : {fmt_amount(user["wallet"])}', uid, user.get("pending_msg_id") or 0)
+                    await bot.edit_message_text(f'شما گل را درست حدس زدید✅🙂\n\n➕{fmt_amount(bet)} سکه به شما اضافه شد\n\n🪙موجودی قبلی شما : {fmt_amount(new_wallet - bet)}\n=============================\n🪙موجودی فعلی شما : {fmt_amount(new_wallet)}', uid, user.get("pending_msg_id") or 0)
                 except Exception:
-                    await bot.send_message(uid, f'شما گل را درست حدس زدید✅🙂\n\n➕{fmt_amount(bet)} سکه به شما اضافه شد\n\n🪙موجودی فعلی شما : {fmt_amount(user["wallet"])}')
+                    await bot.send_message(uid, f'شما گل را درست حدس زدید✅🙂\n\n➕{fmt_amount(bet)} سکه به شما اضافه شد\n\n🪙موجودی فعلی شما : {fmt_amount(new_wallet)}')
             else:
-                user["wallet"] -= bet
-                if user["wallet"] < 1000:
-                    user["wallet"] = 1000
+                new_wallet = await change_wallet_atomic(uid, -bet)
+                if new_wallet < 1000:
+                    diff = 1000 - new_wallet
+                    if diff > 0:
+                        new_wallet = await change_wallet_atomic(uid, diff)
+
                 try:
-                    await bot.edit_message_text(f'شما نتوانستید گل را حدس بزنید❌🥺\n\n➖{fmt_amount(bet)} سکه از شما کم شد\n\n🪙موجودی قبلی شما : {fmt_amount(user["wallet"] + bet)}\n=============================\n🪙موجودی فعلی شما : {fmt_amount(user["wallet"])}', uid, user.get("pending_msg_id") or 0)
+                    await bot.edit_message_text(f'شما نتوانستید گل را حدس بزنید❌🥺\n\n➖{fmt_amount(bet)} سکه از شما کم شد\n\n🪙موجودی قبلی شما : {fmt_amount(new_wallet + bet)}\n=============================\n🪙موجودی فعلی شما : {fmt_amount(new_wallet)}', uid, user.get("pending_msg_id") or 0)
                 except Exception:
-                    await bot.send_message(uid, f'شما نتوانستید گل را حدس بزنید❌🥺\n\n➖{fmt_amount(bet)} سکه از شما کم شد\n\n🪙موجودی فعلی شما : {fmt_amount(user["wallet"])}')
+                    await bot.send_message(uid, f'شما نتوانستید گل را حدس بزنید❌🥺\n\n➖{fmt_amount(bet)} سکه از شما کم شد\n\n🪙موجودی فعلی شما : {fmt_amount(new_wallet)}')
             # پایان بازی rps
             user["state"] = None
             user["bet_amount"] = 0
             user["pending_msg_id"] = None
-            await save_data()
             await bot.send_message(uid, "برگشت به منوی اصلی", reply_markup=main_keyboard(uid))
             return
 
@@ -746,7 +795,6 @@ async def main_message_handler(message: types.Message):
                 await bot.send_message(uid, "نمی‌توانید به خودتان گیفت بزنید.", reply_markup=main_keyboard(uid))
                 user["state"] = None
                 user["temp_gift_to"] = None
-                await save_data()
                 return
 
             # گیرنده باید قبلاً با ربات شروع کرده باشد
@@ -758,7 +806,6 @@ async def main_message_handler(message: types.Message):
 
             user["temp_gift_to"] = int(rec_id)
             user["state"] = "awaiting_gift_amount"
-            await save_data()
             await bot.send_message(uid, f"مقدار سکه رو وارد کن:\n💰 موجودی شما: {fmt_amount(user['wallet'])}", reply_markup=bet_amount_keyboard())
             return
 
@@ -789,27 +836,28 @@ async def main_message_handler(message: types.Message):
                 user["state"] = None
                 user["temp_gift_to"] = None
                 return
+            
+            # اطمینان از وجود کاربرها
+            await ensure_user(uid)
+            await ensure_user(rec_id)
 
-            # نهایی‌سازی انتقال
-            recipient_data = await ensure_user(rec_id)
+            # اتمیک - sender و recipient
+            new_sender_wallet = await change_wallet_atomic(uid, -int(amount))
+            new_rec_wallet = await change_wallet_atomic(rec_id, +int(amount))
 
-            user["wallet"] -= amount
-            recipient_data["wallet"] += amount
-
-            # بازنشانی state و ذخیره
-            user["state"] = None
-            user["temp_gift_to"] = None
-            await save_data()
+            # sync local vars (recipient_data ممکن است قبلا خوانده شده باشد)
+            recipient_data = users_data.get(str(rec_id))
+            sender_tag = f"@{message.chat.username}" if getattr(message.chat, "username", None) else await get_display_name(uid)
 
             # پیام به فرستنده
             try:
-                await bot.send_message(uid, f"🎁گیفت با موفقیت انجام شد✅\n\n🔄انتقال {fmt_amount(amount)} 🪙\n↗️از: @{message.chat.username}\n↙️به: {await get_display_name(rec_id)}\n\n➖{fmt_amount(amount)} سکه از شما کم شد\n\n🪙موجودی فرد مقابل : {fmt_amount(recipient_data['wallet'])}\n=============================\n🪙موجودی شما : {fmt_amount(user['wallet'])}", reply_markup=main_keyboard(uid))
+                await bot.send_message(uid, f"🎁گیفت با موفقیت انجام شد✅\n\n🔄انتقال {fmt_amount(amount)} 🪙\n↗️از: {sender_tag}\n↙️به: {await get_display_name(rec_id)}\n\n➖{fmt_amount(amount)} سکه از شما کم شد\n\n🪙موجودی فرد مقابل : {fmt_amount(new_rec_wallet)}\n=============================\n🪙موجودی شما : {fmt_amount(new_sender_wallet)}", reply_markup=main_keyboard(uid))
             except Exception:
                 pass
 
             # پیام به گیرنده — اگر ارسال پیام با خطا مواجه شد، به فرستنده اطلاع می‌دهیم
             try:
-                await bot.send_message(rec_id, hbold(f'🎁 رسید گیفت:\n🔄 انتقال: {fmt_amount(amount)} 🪙\n↗️ از: @{message.chat.username}\n↙️ به: {await get_display_name(rec_id)}\n\n🪙موجودی شما : {fmt_amount(recipient_data["wallet"])}'), parse_mode="HTML", reply_markup=main_keyboard(rec_id))
+                await bot.send_message(rec_id, hbold(f'🎁 رسید گیفت:\n🔄 انتقال: {fmt_amount(amount)} 🪙\n↗️ از: {sender_tag}\n↙️ به: {await get_display_name(rec_id)}\n\n🪙موجودی شما : {fmt_amount(new_rec_wallet)}'), parse_mode="HTML", reply_markup=main_keyboard(rec_id))
             except Exception:
                 pass
             return
@@ -893,8 +941,6 @@ async def main_message_handler(message: types.Message):
             # sanitize
             if "💰" in user_plain:
                 user_plain = user_plain.replace("💰", " ")
-            if "✅" in user_plain:
-                user_plain = user_plain.replace("✅", "☑️")
             sanitized_body = user_plain
             origin_id = str(uuid.uuid4())
 
@@ -947,12 +993,27 @@ async def main_message_handler(message: types.Message):
 
 @app.on_event("startup")
 async def on_startup():
+    try:
+        await init_db()
+        await load_data()
+        print("DB initialized and users loaded:", len(users_data))
+    except Exception as e:
+        print("DB init/load failed:", e)
+
     # start prune loop background
     app.state.prune_task = asyncio.create_task(prune_loop())
+    # start telethon in background
     asyncio.create_task(_start_telethon())
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    global DB_POOL
+    if DB_POOL:
+        try:
+            await DB_POOL.close()
+        except Exception:
+            pass
     task = getattr(app.state, "prune_task", None)
     if task:
         task.cancel()
